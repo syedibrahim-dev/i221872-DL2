@@ -1,17 +1,6 @@
-# Deep Learning - Assignment 2: Legal Clause Similarity
-#
-# This script implements a complete pipeline to tackle the legal clause similarity task.
-#
-# INSTRUCTIONS:
-# 1. Make sure you have a folder named 'dataset' in the same directory,
-#    containing all your .csv files.
-# 2. Run this command in your terminal first to install all required libraries:
-#    pip install pandas tensorflow scikit-learn nltk
-# 3. *** DELETE 'model_bilstm.keras' and 'model_attention.keras' if they exist! ***
-# 4. Run this script:
-#    python assign2.py
+# Deep Learning - Assignment 2: Legal Clause Similarity (PyTorch Version)
+# Robust version with better error handling and checkpointing
 
-# --- 1. IMPORTS ---
 import os
 import re
 import json
@@ -26,276 +15,272 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
                              f1_score, roc_auc_score, classification_report,
                              average_precision_score, confusion_matrix)
+from collections import Counter
 
-# Suppress TensorFlow warnings
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
-import tensorflow as tf
-from tensorflow.keras.preprocessing.text import Tokenizer, tokenizer_from_json
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.models import Model, load_model
-from tensorflow.keras.layers import (Input, Embedding, Bidirectional, LSTM,
-                                     GlobalMaxPooling1D, GlobalAveragePooling1D,
-                                     Attention, Dense, Dropout, Lambda)
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-import tensorflow.keras.backend as K
+# PyTorch Imports
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 
-print("TensorFlow Version:", tf.__version__)
+# Suppress warnings
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
-# --- 2. CONFIGURATION ---
-
-# Data parameters
-DATA_DIR = 'dataset'  # Folder containing all the .csv files
-
-# Preprocessing parameters
-MAX_VOCAB_SIZE = 20000  # Max words to keep in the vocabulary
-MAX_SEQ_LEN = 256       # Max length for a clause (truncate/pad)
-
-# --- PAIR SAMPLING LIMITS ---
-# 40,000 positive + 40,000 negative = 80,000 total pairs.
+# --- CONFIGURATION ---
+DATA_DIR = 'dataset'
+MAX_VOCAB_SIZE = 20000
+MAX_SEQ_LEN = 256
 MAX_POSITIVE_PAIRS = 40000
 MAX_NEGATIVE_PAIRS = 40000
-
 TEST_SPLIT_SIZE = 0.2
 RANDOM_STATE = 42
 
-# --- EMERGENCY SPEED-UP CONFIG ---
-# These are set to get a result *fast*
-LSTM_UNITS = 32         # Reduced from 64
-EPOCHS = 10             # Reduced from 20
-BATCH_SIZE = 128        # Increased from 64 (faster training)
-TRAIN_SUBSET_SIZE = 15000 # Use only 15k pairs for training (key speedup)
-# --- END SPEED-UP CONFIG ---
+# Speed-up config
+LSTM_UNITS = 32
+EPOCHS = 10
+BATCH_SIZE = 128
+TRAIN_SUBSET_SIZE = 15000
+EMBEDDING_DIM = 128
 
-EMBEDDING_DIM = 128 # This can stay 128
+# Device
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {DEVICE}")
 
-# Processed file paths
+# File paths
 TRAIN_DATA_FILE = 'train_data.npz'
 VAL_DATA_FILE = 'val_data.npz'
-TOKENIZER_FILE = 'tokenizer.json'
+VOCAB_FILE = 'vocab.json'
 CONFIG_FILE = 'model_config.json'
-MODEL_BILSTM_FILE = 'model_bilstm.keras'
-MODEL_ATTENTION_FILE = 'model_attention.keras'
+MODEL_BILSTM_FILE = 'model_bilstm.pt'
+MODEL_ATTENTION_FILE = 'model_attention.pt'
+CHECKPOINT_BILSTM = 'checkpoint_bilstm.pt'
+CHECKPOINT_ATTENTION = 'checkpoint_attention.pt'
 
-# --- 3. DATA LOADING & PREPROCESSING (HELPER FUNCTIONS) ---
+# --- HELPER FUNCTIONS ---
+
+def safe_operation(func, error_msg, default_return=None):
+    """Wrapper for safe execution with error handling"""
+    try:
+        return func()
+    except Exception as e:
+        print(f"ERROR: {error_msg}")
+        print(f"Details: {str(e)}")
+        return default_return
 
 def download_nltk_resources():
-    """Checks for and downloads NLTK stopwords if missing."""
+    """Download NLTK resources if missing"""
     try:
         nltk.data.find('corpora/stopwords')
-        print("NLTK 'stopwords' resource already downloaded.")
+        print("✓ NLTK 'stopwords' resource available.")
     except LookupError:
-        print("Downloading NLTK 'stopwords' resource...")
-        nltk.download('stopwords')
-        print("Download complete.")
+        print("Downloading NLTK 'stopwords'...")
+        nltk.download('stopwords', quiet=True)
+        print("✓ Download complete.")
 
 def load_all_csvs_from_folder(folder_path):
-    """
-    Finds all .csv files in the specified folder, reads them into
-    pandas DataFrames, and concatenates them into a single DataFrame.
-    
-    This function specifically looks for 'clause_text' and 'clause_type'
-    as per the Kaggle dataset and renames them.
-    """
+    """Load and combine all CSV files from folder"""
     print(f"Scanning for CSV files in '{folder_path}'...")
     search_path = os.path.join(folder_path, '*.csv')
     csv_files = glob.glob(search_path)
     
     if not csv_files:
-        print(f"No CSV files found in '{folder_path}'.")
+        print(f"❌ No CSV files found in '{folder_path}'.")
         return None
         
     print(f"Found {len(csv_files)} CSV files. Reading and combining...")
     dataframes_list = []
+    
     for filepath in csv_files:
         filename = os.path.basename(filepath)
-        try:
+        def load_csv():
             df = pd.read_csv(filepath)
-
-            # --- Column Check & Rename (Kaggle Dataset Specific) ---
             if 'clause_text' in df.columns and 'clause_type' in df.columns:
-                # Rename columns to match what the rest of the script expects
                 df = df.rename(columns={
                     'clause_text': 'Clause',
                     'clause_type': 'Category'
                 })
             elif 'Clause' not in df.columns or 'Category' not in df.columns:
-                # If it doesn't have *either* set of names, then skip
-                # print(f"Warning: Skipping {filename}. Missing required columns ('Clause'/'Category' or 'clause_text'/'clause_type').")
-                continue
-            
+                print(f"⚠ Skipping {filename}: Missing required columns")
+                return None
+            return df
+        
+        df = safe_operation(load_csv, f"Failed to load {filename}")
+        if df is not None:
             dataframes_list.append(df)
             
-        except pd.errors.EmptyDataError:
-            # print(f"Warning: Skipping {filename} because it is empty.")
-            continue
-        except Exception as e:
-            print(f"Error reading {filename}: {e}")
-            
     if not dataframes_list:
-        print("No valid data was loaded. Aborting.")
+        print("❌ No valid data loaded.")
         return None
         
     all_data = pd.concat(dataframes_list, ignore_index=True)
-    print("Successfully combined all CSV files.")
+    print(f"✓ Successfully combined {len(dataframes_list)} CSV files ({len(all_data)} rows).")
     return all_data
 
 def clean_text(text):
-    """
-    Cleans a single string of text.
-    """
+    """Clean a single text string"""
     if not isinstance(text, str):
         return ""
-    # Get stopwords once and cache it
     if not hasattr(clean_text, 'stop_words'):
         clean_text.stop_words = set(stopwords.words('english'))
-        
     text = text.lower()
-    text = re.sub(r'[^a-z\s]', '', text) # Keep only letters and spaces
+    text = re.sub(r'[^a-z\s]', '', text)
     tokens = text.split()
     tokens = [word for word in tokens if word not in clean_text.stop_words]
     return " ".join(tokens)
 
 def create_similarity_pairs(df, max_pos, max_neg):
-    """
-    Samples a fixed number of positive (similar) and negative (dissimilar) pairs
-    to create a balanced, manageable dataset.
-    Returns: (text_pairs_1, text_pairs_2, labels)
-    """
-    print("Generating similarity pairs by sampling...")
-    text_pairs_1 = []
-    text_pairs_2 = []
-    labels = []
+    """Generate positive and negative pairs"""
+    print("Generating similarity pairs...")
+    text_pairs_1, text_pairs_2, labels = [], [], []
     
-    # --- EFFICIENT SAMPLING FIX ---
-    # Create a dictionary {category: [list of clauses]} ONCE.
-    print("Creating clause lookup map for efficient sampling...")
     category_map = {cat: group['Clause'].tolist() for cat, group in df.groupby('Category')}
-    
-    # Filter for categories that can form pairs
     categories_with_pairs = [cat for cat, clauses in category_map.items() if len(clauses) > 1]
     categories_all = list(category_map.keys())
-    # --- END FIX ---
 
     if not categories_with_pairs:
-        print("Error: No categories found with more than one clause. Cannot generate positive pairs.")
+        print("❌ No categories with multiple clauses found.")
         return [], [], []
     
-    # --- 1. Generate Positive Pairs (Similar) by Sampling ---
+    # Positive pairs
     print(f"Sampling {max_pos} positive pairs...")
     positive_count = 0
-    while positive_count < max_pos:
+    attempts = 0
+    max_attempts = max_pos * 10
+    
+    while positive_count < max_pos and attempts < max_attempts:
+        attempts += 1
         try:
-            # Pick a random category that has more than one clause
             category = np.random.choice(categories_with_pairs)
-            
-            # Sample two *different* clauses from the pre-computed list
             clause1, clause2 = np.random.choice(category_map[category], 2, replace=False)
-            
             text_pairs_1.append(clause1)
             text_pairs_2.append(clause2)
-            labels.append(1) # 1 = Similar
+            labels.append(1)
             positive_count += 1
-
-            if positive_count % 10000 == 0:
-                print(f"... {positive_count} positive pairs generated", end='\r')
-
-        except ValueError:
-            # This might happen if a category is small, just retry
-            continue
-        except Exception as e:
-            print(f"Error sampling positive pair: {e}")
+        except:
             continue
     
-    print(f"\nTotal positive pairs generated: {positive_count}")
+    print(f"✓ Generated {positive_count} positive pairs")
     
-    # --- 2. Generate Negative Pairs (Dissimilar) by Sampling ---
+    # Negative pairs
     print(f"Sampling {max_neg} negative pairs...")
     negative_count = 0
-    while negative_count < max_neg:
+    attempts = 0
+    
+    while negative_count < max_neg and attempts < max_attempts:
+        attempts += 1
         try:
-            # Pick two different random categories
             cat1_name, cat2_name = np.random.choice(categories_all, 2, replace=False)
-            
-            # Pick one random *original* clause from each pre-computed list
             clause1 = np.random.choice(category_map[cat1_name])
             clause2 = np.random.choice(category_map[cat2_name])
-            
             text_pairs_1.append(clause1)
             text_pairs_2.append(clause2)
-            labels.append(0) # 0 = Dissimilar
+            labels.append(0)
             negative_count += 1
-
-            if negative_count % 10000 == 0:
-                print(f"... {negative_count} negative pairs generated", end='\r')
-
-        except Exception as e:
-            print(f"Error sampling negative pair: {e}")
+        except:
             continue
-            
-    print(f"\nTotal pairs generated (positive + negative): {len(labels)}")
+    
+    print(f"✓ Generated {negative_count} negative pairs")
+    print(f"✓ Total pairs: {len(labels)}")
     return text_pairs_1, text_pairs_2, labels
 
-def run_preprocessing():
-    """Runs the full preprocessing pipeline and saves data to disk."""
+def build_vocabulary(texts, max_vocab_size):
+    """Build vocabulary from texts"""
+    print("Building vocabulary...")
+    all_tokens = []
+    for text in texts:
+        all_tokens.extend(text.split())
     
-    print("--- STARTING PREPROCESSING ---")
+    token_counts = Counter(all_tokens)
+    most_common = token_counts.most_common(max_vocab_size - 2)  # -2 for special tokens
+    
+    # Create vocabulary
+    vocab = {'<pad>': 0, '<unk>': 1}
+    for idx, (token, _) in enumerate(most_common, start=2):
+        vocab[token] = idx
+    
+    print(f"✓ Vocabulary built (size: {len(vocab)})")
+    return vocab
+
+def texts_to_sequences(texts, vocab):
+    """Convert texts to sequences of indices"""
+    sequences = []
+    for text in texts:
+        seq = [vocab.get(token, vocab['<unk>']) for token in text.split()]
+        sequences.append(seq)
+    return sequences
+
+def pad_sequence(seq, max_len, pad_idx):
+    """Pad or truncate sequence"""
+    if len(seq) > max_len:
+        return seq[:max_len]
+    else:
+        return seq + [pad_idx] * (max_len - len(seq))
+
+def run_preprocessing():
+    """Run full preprocessing pipeline"""
+    print("\n" + "="*60)
+    print("STARTING PREPROCESSING")
+    print("="*60)
     start_time = time.time()
     
-    # 0. Download NLTK data
+    # Step 1: Download NLTK resources
     download_nltk_resources()
-
-    # 1. Load Data
+    
+    # Step 2: Load data
     df = load_all_csvs_from_folder(DATA_DIR)
-    if df is None: 
-        print("Preprocessing failed at data loading step.")
-        return False # Return False on failure
-    
-    df = df.dropna(subset=['Clause', 'Category'])
-    df = df.drop_duplicates(subset=['Clause'])
-
-    # 2. Create Pairs from ORIGINAL text
-    original_p1, original_p2, labels = create_similarity_pairs(df, MAX_POSITIVE_PAIRS, MAX_NEGATIVE_PAIRS)
-    labels = np.array(labels)
-    
-    if len(labels) == 0:
-        print("No pairs were generated. Check your data and sampling logic.")
+    if df is None:
         return False
-
-    # 3. Clean Text
-    print("Cleaning text pairs...")
+    
+    # Step 3: Clean data
+    print("\nCleaning data...")
+    df = df.dropna(subset=['Clause', 'Category']).drop_duplicates(subset=['Clause'])
+    print(f"✓ Data cleaned ({len(df)} unique clauses)")
+    
+    # Step 4: Generate pairs
+    original_p1, original_p2, labels = create_similarity_pairs(df, MAX_POSITIVE_PAIRS, MAX_NEGATIVE_PAIRS)
+    if not labels:
+        return False
+    
+    # Step 5: Clean text
+    print("\nCleaning text pairs...")
     cleaned_p1 = [clean_text(t) for t in original_p1]
     cleaned_p2 = [clean_text(t) for t in original_p2]
-
-    # 4. Tokenization
-    print("Tokenizing text...")
     all_cleaned_text = cleaned_p1 + cleaned_p2
-    tokenizer = Tokenizer(num_words=MAX_VOCAB_SIZE, oov_token="<OOV>")
-    tokenizer.fit_on_texts(all_cleaned_text)
+    print("✓ Text cleaning complete")
     
-    with open(TOKENIZER_FILE, 'w', encoding='utf-8') as f:
-        f.write(json.dumps(tokenizer.to_json(), ensure_ascii=False))
-    print(f"Tokenizer saved to {TOKENIZER_FILE}")
+    # Step 6: Build vocabulary
+    vocab = build_vocabulary(all_cleaned_text, MAX_VOCAB_SIZE)
+    PAD_IDX = vocab['<pad>']
+    VOCAB_SIZE = len(vocab)
     
-    vocab_size = min(MAX_VOCAB_SIZE, len(tokenizer.word_index) + 1)
-
-    # 5. Convert text to sequences & 6. Padding
-    print(f"Padding sequences to max length {MAX_SEQ_LEN}...")
-    seq_p1 = tokenizer.texts_to_sequences(cleaned_p1)
-    seq_p2 = tokenizer.texts_to_sequences(cleaned_p2)
+    # Save vocabulary
+    with open(VOCAB_FILE, 'w') as f:
+        json.dump(vocab, f)
+    print(f"✓ Vocabulary saved to {VOCAB_FILE}")
     
-    padded_p1 = pad_sequences(seq_p1, maxlen=MAX_SEQ_LEN, padding='post', truncating='post')
-    padded_p2 = pad_sequences(seq_p2, maxlen=MAX_SEQ_LEN, padding='post', truncating='post')
+    # Step 7: Convert to sequences
+    print("\nConverting texts to sequences...")
+    seq_p1 = texts_to_sequences(cleaned_p1, vocab)
+    seq_p2 = texts_to_sequences(cleaned_p2, vocab)
+    print("✓ Conversion complete")
     
-    # 7. Train/Test Split
-    print("Splitting data into train and validation sets...")
+    # Step 8: Pad sequences
+    print(f"Padding sequences to length {MAX_SEQ_LEN}...")
+    padded_p1 = np.array([pad_sequence(s, MAX_SEQ_LEN, PAD_IDX) for s in seq_p1])
+    padded_p2 = np.array([pad_sequence(s, MAX_SEQ_LEN, PAD_IDX) for s in seq_p2])
+    labels = np.array(labels)
+    print("✓ Padding complete")
+    
+    # Step 9: Train/validation split
+    print("\nSplitting data...")
     indices = np.arange(len(labels))
-    
     (train_indices, val_indices, 
      train_labels, val_labels) = train_test_split(indices, labels, 
                                                    test_size=TEST_SPLIT_SIZE, 
                                                    random_state=RANDOM_STATE, 
                                                    stratify=labels)
-
+    
     train_p1, val_p1 = padded_p1[train_indices], padded_p1[val_indices]
     train_p2, val_p2 = padded_p2[train_indices], padded_p2[val_indices]
     
@@ -303,202 +288,219 @@ def run_preprocessing():
     original_p2_np = np.array(original_p2)
     val_orig_p1 = original_p1_np[val_indices]
     val_orig_p2 = original_p2_np[val_indices]
-     
-    # 8. Save Processed Data
-    print("Saving processed data to disk...")
-    np.savez_compressed(TRAIN_DATA_FILE, 
-                        pair1=train_p1, 
-                        pair2=train_p2, 
-                        labels=train_labels)
-                        
-    np.savez_compressed(VAL_DATA_FILE, 
-                        pair1=val_p1, 
-                        pair2=val_p2, 
-                        labels=val_labels, 
-                        orig_pair1=val_orig_p1, 
-                        orig_pair2=val_orig_p2)
     
-    config = {'max_seq_len': MAX_SEQ_LEN, 'vocab_size': vocab_size, 'embedding_dim': EMBEDDING_DIM}
+    print(f"✓ Train size: {len(train_labels)}, Validation size: {len(val_labels)}")
+    
+    # Step 10: Save processed data
+    print("\nSaving processed data...")
+    np.savez_compressed(TRAIN_DATA_FILE, pair1=train_p1, pair2=train_p2, labels=train_labels)
+    np.savez_compressed(VAL_DATA_FILE, pair1=val_p1, pair2=val_p2, labels=val_labels, 
+                       orig_pair1=val_orig_p1, orig_pair2=val_orig_p2)
+    
+    config = {
+        'max_seq_len': MAX_SEQ_LEN, 
+        'vocab_size': VOCAB_SIZE, 
+        'embedding_dim': EMBEDDING_DIM, 
+        'pad_idx': PAD_IDX
+    }
     with open(CONFIG_FILE, 'w') as f:
         json.dump(config, f)
     
-    print("--- PREPROCESSING COMPLETE ---")
-    print(f"Total time: {(time.time() - start_time):.2f} seconds")
-    print(f"Training pairs: {len(train_labels)}")
-    print(f"Validation pairs: {len(val_labels)}")
-    return True # Return True on success
+    print(f"✓ Data saved to {TRAIN_DATA_FILE} and {VAL_DATA_FILE}")
+    print(f"✓ Config saved to {CONFIG_FILE}")
+    
+    elapsed = time.time() - start_time
+    print(f"\n✓ PREPROCESSING COMPLETE (Time: {elapsed:.2f}s)")
+    print("="*60 + "\n")
+    return True
 
+# --- PYTORCH DATASET ---
 
-# --- 4. LOAD PROCESSED DATA ---
+class ClausePairDataset(Dataset):
+    def __init__(self, p1, p2, labels):
+        self.p1 = torch.tensor(p1, dtype=torch.long)
+        self.p2 = torch.tensor(p2, dtype=torch.long)
+        self.labels = torch.tensor(labels, dtype=torch.float)
 
-def load_processed_data():
-    """Loads all preprocessed data files from disk."""
-    print("\n--- LOADING PROCESSED DATA ---")
-    
-    with open(CONFIG_FILE, 'r') as f:
-        model_config = json.load(f)
-    
-    vocab_size = model_config['vocab_size']
-    max_seq_len = model_config['max_seq_len']
-    embedding_dim = model_config['embedding_dim']
-    
-    with np.load(TRAIN_DATA_FILE) as data:
-        train_p1 = data['pair1']
-        train_p2 = data['pair2']
-        train_labels = data['labels']
-    
-    with np.load(VAL_DATA_FILE, allow_pickle=True) as data:
-        val_p1 = data['pair1']
-        val_p2 = data['pair2']
-        val_labels = data['labels']
-        val_orig_p1 = data['orig_pair1']
-        val_orig_p2 = data['orig_pair2']
-    
-    print("Data loaded successfully.")
-    print(f"Vocab Size: {vocab_size}")
-    
-    # Pack data into tuples for easier handling
-    train_data = (train_p1, train_p2, train_labels)
-    val_data = (val_p1, val_p2, val_labels, val_orig_p1, val_orig_p2)
-    config = (vocab_size, max_seq_len, embedding_dim)
-    
-    return train_data, val_data, config
+    def __len__(self):
+        return len(self.labels)
 
+    def __getitem__(self, idx):
+        return self.p1[idx], self.p2[idx], self.labels[idx]
 
-# --- 5. MODEL 1: SIAMESE BiLSTM ---
+# --- MODELS ---
 
-def build_bilstm_model(vocab_size, embedding_dim, max_seq_len, lstm_units):
-    """Builds the shared encoder for the Siamese BiLSTM model."""
-    
-    input_layer = Input(shape=(max_seq_len,))
-    embedding_layer = Embedding(input_dim=vocab_size, 
-                                output_dim=embedding_dim, 
-                                input_length=max_seq_len)(input_layer)
-    
-    # FIX: Added return_sequences=True
-    bilstm = Bidirectional(LSTM(lstm_units, return_sequences=True))(embedding_layer)
-    
-    pooling = GlobalMaxPooling1D()(bilstm) 
-    
-    # This is the output shape from the pooling layer
-    encoder_output_shape = pooling.shape[-1] 
-    
-    encoder = Model(inputs=input_layer, outputs=pooling)
-    
-    # Define the Siamese inputs
-    input_a = Input(shape=(max_seq_len,))
-    input_b = Input(shape=(max_seq_len,))
-    
-    # Get the encoded vectors
-    vec_a = encoder(input_a)
-    vec_b = encoder(input_b)
-    
-    # --- FIX: Added output_shape to Lambda layer ---
-    distance = Lambda(
-        lambda x: K.abs(x[0] - x[1]),
-        output_shape=(encoder_output_shape,) 
-    )([vec_a, vec_b])
-    
-    # Final classifier
-    classifier = Dense(64, activation='relu')(distance)
-    classifier = Dropout(0.3)(classifier)
-    output = Dense(1, activation='sigmoid')(classifier)
-    
-    model = Model(inputs=[input_a, input_b], outputs=output)
-    
-    model.compile(loss='binary_crossentropy', 
-                  optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-                  metrics=['accuracy'])
-    return model
+class SiameseBiLSTM(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, lstm_units, pad_idx):
+        super(SiameseBiLSTM, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=pad_idx)
+        self.lstm = nn.LSTM(embedding_dim, lstm_units, batch_first=True, bidirectional=True)
+        
+        self.fc = nn.Sequential(
+            nn.Linear(lstm_units * 2, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 1)
+        )
 
+    def forward_once(self, x):
+        embedded = self.embedding(x)
+        lstm_out, _ = self.lstm(embedded)
+        pooled = torch.max(lstm_out, dim=1)[0]
+        return pooled
 
-# --- 6. MODEL 2: SIAMESE BiLSTM with ATTENTION ---
+    def forward(self, p1, p2):
+        vec_a = self.forward_once(p1)
+        vec_b = self.forward_once(p2)
+        distance = torch.abs(vec_a - vec_b)
+        out = self.fc(distance)
+        return out.squeeze()
 
-def build_attention_model(vocab_size, embedding_dim, max_seq_len, lstm_units):
-    """Builds the shared encoder for the Siamese Attention model."""
-    
-    input_layer = Input(shape=(max_seq_len,))
-    embedding_layer = Embedding(input_dim=vocab_size, 
-                                output_dim=embedding_dim, 
-                                input_length=max_seq_len)(input_layer)
-    bilstm = Bidirectional(LSTM(lstm_units, return_sequences=True))(embedding_layer)
-    
-    attention_output = Attention()([bilstm, bilstm])
-    pooling = GlobalAveragePooling1D()(attention_output)
+class SiameseAttentionBiLSTM(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, lstm_units, pad_idx):
+        super(SiameseAttentionBiLSTM, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=pad_idx)
+        self.lstm = nn.LSTM(embedding_dim, lstm_units, batch_first=True, bidirectional=True)
+        
+        lstm_output_dim = lstm_units * 2
+        self.attention = nn.Linear(lstm_output_dim, 1)
+        
+        self.fc = nn.Sequential(
+            nn.Linear(lstm_output_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 1)
+        )
 
-    # This is the output shape from the pooling layer
-    encoder_output_shape = pooling.shape[-1]
+    def forward_once(self, x):
+        embedded = self.embedding(x)
+        lstm_out, _ = self.lstm(embedded)
+        
+        attn_weights = torch.tanh(self.attention(lstm_out))
+        attn_weights = torch.softmax(attn_weights, dim=1)
+        context_vector = torch.sum(attn_weights * lstm_out, dim=1)
+        return context_vector
 
-    encoder = Model(inputs=input_layer, outputs=pooling)
-    
-    input_a = Input(shape=(max_seq_len,))
-    input_b = Input(shape=(max_seq_len,))
-    
-    vec_a = encoder(input_a)
-    vec_b = encoder(input_b)
-    
-    # --- FIX: Added output_shape to Lambda layer ---
-    distance = Lambda(
-        lambda x: K.abs(x[0] - x[1]),
-        output_shape=(encoder_output_shape,)
-    )([vec_a, vec_b])
-    
-    classifier = Dense(64, activation='relu')(distance)
-    classifier = Dropout(0.3)(classifier)
-    output = Dense(1, activation='sigmoid')(classifier)
-    
-    model = Model(inputs=[input_a, input_b], outputs=output)
-    
-    model.compile(loss='binary_crossentropy', 
-                  optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-                  metrics=['accuracy'])
-    return model
+    def forward(self, p1, p2):
+        vec_a = self.forward_once(p1)
+        vec_b = self.forward_once(p2)
+        distance = torch.abs(vec_a - vec_b)
+        out = self.fc(distance)
+        return out.squeeze()
 
+# --- TRAINING FUNCTIONS ---
 
-# --- 7. EVALUATION & COMPARISON ---
+def train_model(model, loader, optimizer, criterion, device):
+    """Train for one epoch"""
+    model.train()
+    total_loss, total_correct, total_samples = 0, 0, 0
+    
+    for p1, p2, labels in loader:
+        p1, p2, labels = p1.to(device), p2.to(device), labels.to(device)
+        
+        optimizer.zero_grad()
+        outputs = model(p1, p2)
+        
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item() * labels.size(0)
+        
+        preds = (torch.sigmoid(outputs) > 0.5).float()
+        total_correct += (preds == labels).sum().item()
+        total_samples += labels.size(0)
+        
+    return total_loss / total_samples, total_correct / total_samples
+
+def evaluate_model(model, loader, criterion, device):
+    """Evaluate model"""
+    model.eval()
+    total_loss, total_correct, total_samples = 0, 0, 0
+    all_probs = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for p1, p2, labels in loader:
+            p1, p2, labels = p1.to(device), p2.to(device), labels.to(device)
+            
+            outputs = model(p1, p2)
+            loss = criterion(outputs, labels)
+            
+            total_loss += loss.item() * labels.size(0)
+            
+            probs = torch.sigmoid(outputs)
+            preds = (probs > 0.5).float()
+            total_correct += (preds == labels).sum().item()
+            total_samples += labels.size(0)
+            
+            all_probs.extend(probs.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            
+    return (total_loss / total_samples, 
+            total_correct / total_samples, 
+            np.array(all_probs), 
+            np.array(all_labels))
+
+def save_checkpoint(model, optimizer, epoch, history, filepath):
+    """Save training checkpoint"""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'history': history
+    }
+    torch.save(checkpoint, filepath)
+
+def load_checkpoint(model, optimizer, filepath):
+    """Load training checkpoint"""
+    if os.path.exists(filepath):
+        checkpoint = torch.load(filepath, map_location=DEVICE)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        return checkpoint['epoch'], checkpoint['history']
+    return 0, {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
 
 def plot_history(history, model_name):
-    """Plots training and validation loss and accuracy."""
+    """Plot training history"""
     plt.figure(figsize=(12, 5))
     
-    # Plot Accuracy
     plt.subplot(1, 2, 1)
-    plt.plot(history.history['accuracy'], label='Training Accuracy')
-    plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    plt.plot(history['train_acc'], label='Training Accuracy')
+    plt.plot(history['val_acc'], label='Validation Accuracy')
     plt.title(f'{model_name} - Accuracy')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy')
     plt.legend()
+    plt.grid(True, alpha=0.3)
     
-    # Plot Loss
     plt.subplot(1, 2, 2)
-    plt.plot(history.history['loss'], label='Training Loss')
-    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.plot(history['train_loss'], label='Training Loss')
+    plt.plot(history['val_loss'], label='Validation Loss')
     plt.title(f'{model_name} - Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
+    plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(f"{model_name}_training_graphs.png")
-    print(f"Saved training graphs to {model_name}_training_graphs.png")
-    # plt.show() # Uncomment this if running interactively
+    filename = f"{model_name}_training_graphs.png"
+    plt.savefig(filename)
+    print(f"✓ Saved training graphs to {filename}")
+    plt.close()
 
-def evaluate_model(model, val_data, model_name):
-    """Calculates and prints all required evaluation metrics."""
-    val_p1, val_p2, val_labels, _, _ = val_data
+def report_metrics(pred_probs, val_labels, model_name):
+    """Calculate and report metrics"""
+    print(f"\n{'='*60}")
+    print(f"EVALUATION: {model_name}")
+    print('='*60)
     
-    print(f"\n--- Evaluating {model_name} ---")
-    
-    # Get predictions
-    pred_probs = model.predict([val_p1, val_p2])
     preds = (pred_probs > 0.5).astype(int)
     
-    # Calculate metrics
     accuracy = accuracy_score(val_labels, preds)
-    precision = precision_score(val_labels, preds)
-    recall = recall_score(val_labels, preds)
-    f1 = f1_score(val_labels, preds)
+    precision = precision_score(val_labels, preds, zero_division=0)
+    recall = recall_score(val_labels, preds, zero_division=0)
+    f1 = f1_score(val_labels, preds, zero_division=0)
     roc_auc = roc_auc_score(val_labels, pred_probs)
     pr_auc = average_precision_score(val_labels, pred_probs)
     
@@ -510,237 +512,208 @@ def evaluate_model(model, val_data, model_name):
     print(f"PR-AUC:      {pr_auc:.4f}")
     
     print("\nClassification Report:")
-    print(classification_report(val_labels, preds, target_names=['Dissimilar (0)', 'Similar (1)']))
-    
-    print("Confusion Matrix:")
-    print(confusion_matrix(val_labels, preds))
+    print(classification_report(val_labels, preds, 
+                                target_names=['Dissimilar (0)', 'Similar (1)'],
+                                zero_division=0))
     
     return {"accuracy": accuracy, "f1": f1, "roc_auc": roc_auc}
 
-
-# --- 8. QUALITATIVE ANALYSIS ---
-
-def show_qualitative_results(model, val_data, model_name, num_examples=5):
-    """Shows examples of correct and incorrect predictions."""
-    val_p1, val_p2, val_labels, val_orig_p1, val_orig_p2 = val_data
+def train_model_full(model, train_loader, val_loader, model_name, model_file, checkpoint_file):
+    """Full training loop with checkpointing"""
+    print(f"\n{'='*60}")
+    print(f"TRAINING: {model_name}")
+    print('='*60)
     
-    pred_probs = model.predict([val_p1, val_p2])
-    preds = (pred_probs > 0.5).astype(int).flatten()
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
     
-    print(f"\n--- Qualitative Analysis for {model_name} ---")
+    # Try to load checkpoint
+    start_epoch, history = load_checkpoint(model, optimizer, checkpoint_file)
     
-    # 1. Correctly Identified as SIMILAR (True Positives)
-    print("\n--- Correctly Identified as SIMILAR (True Positives) ---")
-    tp_indices = np.where((preds == 1) & (val_labels == 1))[0]
-    if len(tp_indices) >= num_examples:
-        for i, idx in enumerate(np.random.choice(tp_indices, num_examples, replace=False)):
-            print(f"\nExample {i+1} (Pred: 1, True: 1):")
-            print(f"  Clause 1: {val_orig_p1[idx][:150]}...")
-            print(f"  Clause 2: {val_orig_p2[idx][:150]}...")
+    if start_epoch > 0:
+        print(f"✓ Resuming from epoch {start_epoch}")
     else:
-        print(f"Not enough examples (found {len(tp_indices)}).")
+        print("Starting fresh training")
+    
+    best_val_acc = max(history['val_acc']) if history['val_acc'] else -1
+    epochs_no_improve = 0
+    patience = 3
+    
+    start_time = time.time()
+    
+    for epoch in range(start_epoch, EPOCHS):
+        try:
+            train_loss, train_acc = train_model(model, train_loader, optimizer, criterion, DEVICE)
+            val_loss, val_acc, _, _ = evaluate_model(model, val_loader, criterion, DEVICE)
+            
+            history['train_loss'].append(train_loss)
+            history['train_acc'].append(train_acc)
+            history['val_loss'].append(val_loss)
+            history['val_acc'].append(val_acc)
+            
+            print(f"Epoch {epoch+1}/{EPOCHS} | "
+                  f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
+                  f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+            
+            # Save checkpoint
+            save_checkpoint(model, optimizer, epoch + 1, history, checkpoint_file)
+            
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save(model.state_dict(), model_file)
+                print(f"✓ Best model saved (Val Acc: {val_acc:.4f})")
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    print(f"Early stopping triggered (no improvement for {patience} epochs)")
+                    break
+                    
+        except Exception as e:
+            print(f"⚠ Error during epoch {epoch+1}: {e}")
+            print("Saving checkpoint and continuing...")
+            save_checkpoint(model, optimizer, epoch + 1, history, checkpoint_file)
+            continue
+            
+    elapsed = time.time() - start_time
+    print(f"✓ Training complete (Time: {elapsed:.2f}s)")
+    
+    # Clean up checkpoint file
+    if os.path.exists(checkpoint_file):
+        os.remove(checkpoint_file)
+        print(f"✓ Removed checkpoint file")
+    
+    plot_history(history, model_name)
+    return history
 
-    # 2. Correctly Identified as DISSIMILAR (True Negatives)
-    print("\n--- Correctly Identified as DISSIMILAR (True Negatives) ---")
-    tn_indices = np.where((preds == 0) & (val_labels == 0))[0]
-    if len(tn_indices) >= num_examples:
-        for i, idx in enumerate(np.random.choice(tn_indices, num_examples, replace=False)):
-            print(f"\nExample {i+1} (Pred: 0, True: 0):")
-            print(f"  Clause 1: {val_orig_p1[idx][:150]}...")
-            print(f"  Clause 2: {val_orig_p2[idx][:150]}...")
-    else:
-        print(f"Not enough examples (found {len(tn_indices)}).")
-
-    # 3. Incorrectly Identified as SIMILAR (False Positives)
-    print("\n--- Incorrectly Identified as SIMILAR (False Positives) ---")
-    fp_indices = np.where((preds == 1) & (val_labels == 0))[0]
-    if len(fp_indices) >= num_examples:
-        for i, idx in enumerate(np.random.choice(fp_indices, num_examples, replace=False)):
-            print(f"\nExample {i+1} (Pred: 1, True: 0):")
-            print(f"  Clause 1: {val_orig_p1[idx][:150]}...")
-            print(f"  Clause 2: {val_orig_p2[idx][:150]}...")
-    else:
-        print(f"Not enough examples (found {len(fp_indices)}).")
-
-    # 4. Incorrectly Identified as DISSIMILAR (False Negatives)
-    print("\n--- Incorrectly Identified as DISSIMILAR (False Negatives) ---")
-    fn_indices = np.where((preds == 0) & (val_labels == 1))[0]
-    if len(fn_indices) >= num_examples:
-        for i, idx in enumerate(np.random.choice(fn_indices, num_examples, replace=False)):
-            print(f"\nExample {i+1} (Pred: 0, True: 1):")
-            print(f"  Clause 1: {val_orig_p1[idx][:150]}...")
-            print(f"  Clause 2: {val_orig_p2[idx][:150]}...")
-    else:
-        print(f"Not enough examples (found {len(fn_indices)}).")
-
-
-# --- 9. MAIN EXECUTION ---
+# --- MAIN FUNCTION ---
 
 def main():
-    """Main function to run the entire pipeline."""
+    """Main execution function"""
+    print("\n" + "="*60)
+    print("LEGAL CLAUSE SIMILARITY - PYTORCH VERSION")
+    print("="*60 + "\n")
     
     # Step 1: Preprocessing
-    # We check if all the necessary files already exist to save time
-    required_files = [TRAIN_DATA_FILE, VAL_DATA_FILE, TOKENIZER_FILE, CONFIG_FILE]
-    all_files_exist = all(os.path.exists(f) for f in required_files)
-    
-    if not all_files_exist:
-        print("One or more processed files are missing. Running preprocessing...")
-        success = run_preprocessing()
-        if not success:
-            print("Preprocessing failed. Exiting script.")
-            return # <-- This will stop the script if preprocessing fails
+    required_files = [TRAIN_DATA_FILE, VAL_DATA_FILE, VOCAB_FILE, CONFIG_FILE]
+    if not all(os.path.exists(f) for f in required_files):
+        print("⚠ Processed files missing. Running preprocessing...\n")
+        if not run_preprocessing():
+            print("❌ Preprocessing failed. Exiting.")
+            return
     else:
-        print("Processed data files found. Skipping preprocessing.")
+        print("✓ Processed files found. Skipping preprocessing.\n")
     
-    # Step 2: Load Data
+    # Step 2: Load data
+    print("Loading data...")
     try:
-        train_data, val_data, config = load_processed_data()
-    except FileNotFoundError as e:
-        print(f"Error loading processed data: {e}")
-        print("Please delete train_data.npz, val_data.npz, tokenizer.json, and model_config.json and re-run the script.")
-        return
+        with open(CONFIG_FILE, 'r') as f:
+            config = json.load(f)
         
-    train_p1, train_p2, train_labels = train_data
-    val_p1, val_p2, val_labels, _, _ = val_data
-    vocab_size, max_seq_len, embedding_dim = config
+        with open(VOCAB_FILE, 'r') as f:
+            vocab = json.load(f)
+        
+        with np.load(TRAIN_DATA_FILE) as data:
+            train_p1, train_p2, train_labels = data['pair1'], data['pair2'], data['labels']
+        
+        with np.load(VAL_DATA_FILE, allow_pickle=True) as data:
+            val_p1, val_p2, val_labels = data['pair1'], data['pair2'], data['labels']
+            val_orig_p1, val_orig_p2 = data['orig_pair1'], data['orig_pair2']
+        
+        vocab_size = config['vocab_size']
+        pad_idx = config['pad_idx']
+        
+        print("✓ Data loaded successfully\n")
+        
+    except Exception as e:
+        print(f"❌ Error loading data: {e}")
+        print("Try deleting all .npz, .json, and .pt files and re-running.")
+        return
     
-    
-    # ---!!! EMERGENCY SPEED-UP: SUBSET THE TRAINING DATA !!!---
-    print(f"\n--- SPEED-UP: Using a subset of {TRAIN_SUBSET_SIZE} training pairs ---")
+    # Subset training data for speed
     if len(train_labels) > TRAIN_SUBSET_SIZE:
+        print(f"⚡ Using subset of {TRAIN_SUBSET_SIZE} training pairs for speed")
         train_p1 = train_p1[:TRAIN_SUBSET_SIZE]
         train_p2 = train_p2[:TRAIN_SUBSET_SIZE]
         train_labels = train_labels[:TRAIN_SUBSET_SIZE]
-    print(f"New training set size: {len(train_labels)}")
-    # ---!!! END SPEED-UP ---
-
-
-    # --- Step 3: Model 1 (BiLSTM) Training ---
-    # --- MODIFICATION: Skip training if model file exists ---
+        print(f"✓ Training set size: {len(train_labels)}\n")
+    
+    # Create dataloaders
+    train_dataset = ClausePairDataset(train_p1, train_p2, train_labels)
+    val_dataset = ClausePairDataset(val_p1, val_p2, val_labels)
+    
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    
+    # Step 3: Train Model 1 (BiLSTM)
     if not os.path.exists(MODEL_BILSTM_FILE):
-        print("\n--- MODEL 1: Siamese BiLSTM ---")
-        model_bilstm = build_bilstm_model(vocab_size, embedding_dim, max_seq_len, LSTM_UNITS)
-        model_bilstm.summary()
+        model_bilstm = SiameseBiLSTM(vocab_size, EMBEDDING_DIM, LSTM_UNITS, pad_idx).to(DEVICE)
+        print(f"Model params: {sum(p.numel() for p in model_bilstm.parameters()):,}")
         
-        callbacks_bilstm = [
-            EarlyStopping(monitor='val_accuracy', patience=3, restore_best_weights=True),
-            ModelCheckpoint(filepath=MODEL_BILSTM_FILE, monitor='val_accuracy', save_best_only=True)
-        ]
-        
-        print("Training Model 1: Siamese BiLSTM...")
-        start_time_bilstm = time.time()
-        history_bilstm = model_bilstm.fit(
-            [train_p1, train_p2], 
-            train_labels, 
-            epochs=EPOCHS,
-            batch_size=BATCH_SIZE,
-            validation_data=([val_p1, val_p2], val_labels),
-            callbacks=callbacks_bilstm
-        )
-        print(f"BiLSTM Training Time: {(time.time() - start_time_bilstm):.2f} seconds")
-        # --- Plot history right after training ---
-        plot_history(history_bilstm, "Siamese_BiLSTM")
+        train_model_full(model_bilstm, train_loader, val_loader, 
+                        "Siamese_BiLSTM", MODEL_BILSTM_FILE, CHECKPOINT_BILSTM)
     else:
-        print(f"\n--- SKIPPING BiLSTM Training: {MODEL_BILSTM_FILE} already exists. ---")
-        history_bilstm = None # No history to plot if we skip training
-
-    # --- Step 4: Model 2 (Attention) Training ---
-    # --- MODIFICATION: Skip training if model file exists ---
+        print(f"✓ {MODEL_BILSTM_FILE} exists. Skipping training.\n")
+    
+    # Step 4: Train Model 2 (Attention)
     if not os.path.exists(MODEL_ATTENTION_FILE):
-        print("\n--- MODEL 2: Siamese BiLSTM with Attention ---")
-        model_attention = build_attention_model(vocab_size, embedding_dim, max_seq_len, LSTM_UNITS)
-        model_attention.summary()
+        model_attention = SiameseAttentionBiLSTM(vocab_size, EMBEDDING_DIM, LSTM_UNITS, pad_idx).to(DEVICE)
+        print(f"Model params: {sum(p.numel() for p in model_attention.parameters()):,}")
         
-        callbacks_attention = [
-            EarlyStopping(monitor='val_accuracy', patience=3, restore_best_weights=True),
-            ModelCheckpoint(filepath=MODEL_ATTENTION_FILE, monitor='val_accuracy', save_best_only=True)
-        ]
-        
-        print("Training Model 2: Siamese BiLSTM with Attention...")
-        start_time_attn = time.time()
-        history_attention = model_attention.fit(
-            [train_p1, train_p2], 
-            train_labels, 
-            epochs=EPOCHS,
-            batch_size=BATCH_SIZE,
-            validation_data=([val_p1, val_p2], val_labels),
-            callbacks=callbacks_attention
-        )
-        print(f"Attention Model Training Time: {(time.time() - start_time_attn):.2f} seconds")
-        # --- Plot history right after training ---
-        plot_history(history_attention, "Siamese_Attention_BiLSTM")
+        train_model_full(model_attention, train_loader, val_loader,
+                        "Siamese_Attention_BiLSTM", MODEL_ATTENTION_FILE, CHECKPOINT_ATTENTION)
     else:
-        print(f"\n--- SKIPPING Attention Training: {MODEL_ATTENTION_FILE} already exists. ---")
-        history_attention = None # No history to plot if we skip training
-
-
-    # --- Step 5: Evaluation & Comparison ---
-    print("\n--- FINAL EVALUATION ---")
+        print(f"✓ {MODEL_ATTENTION_FILE} exists. Skipping training.\n")
     
-    # --- MODIFICATION: Define variables as None first ---
-    best_model_bilstm = None
-    best_model_attention = None
+    # Step 5: Evaluation
+    print("\n" + "="*60)
+    print("FINAL EVALUATION")
+    print("="*60)
     
-    # Load the *best* saved weights for a fair comparison
+    criterion = nn.BCEWithLogitsLoss()
+    
+    # Evaluate BiLSTM
     try:
-        # --- MODIFICATION: Added safe_mode=False ---
-        print(f"Loading {MODEL_BILSTM_FILE}...")
-        best_model_bilstm = load_model(MODEL_BILSTM_FILE, safe_mode=False)
-        metrics_bilstm = evaluate_model(best_model_bilstm, val_data, "Siamese BiLSTM")
+        model_bilstm = SiameseBiLSTM(vocab_size, EMBEDDING_DIM, LSTM_UNITS, pad_idx).to(DEVICE)
+        model_bilstm.load_state_dict(torch.load(MODEL_BILSTM_FILE, map_location=DEVICE))
+        _, _, bilstm_probs, bilstm_labels = evaluate_model(model_bilstm, val_loader, criterion, DEVICE)
+        metrics_bilstm = report_metrics(bilstm_probs, bilstm_labels, "Siamese BiLSTM")
     except Exception as e:
-        print(f"Error loading or evaluating BiLSTM model: {e}")
+        print(f"⚠ Error evaluating BiLSTM: {e}")
         metrics_bilstm = {"accuracy": 0, "f1": 0, "roc_auc": 0}
-
+    
+    # Evaluate Attention
     try:
-        # --- MODIFICATION: Added safe_mode=False ---
-        print(f"Loading {MODEL_ATTENTION_FILE}...")
-        best_model_attention = load_model(MODEL_ATTENTION_FILE, safe_mode=False)
-        metrics_attention = evaluate_model(best_model_attention, val_data, "Siamese BiLSTM with Attention")
+        model_attention = SiameseAttentionBiLSTM(vocab_size, EMBEDDING_DIM, LSTM_UNITS, pad_idx).to(DEVICE)
+        model_attention.load_state_dict(torch.load(MODEL_ATTENTION_FILE, map_location=DEVICE))
+        _, _, attn_probs, attn_labels = evaluate_model(model_attention, val_loader, criterion, DEVICE)
+        metrics_attention = report_metrics(attn_probs, attn_labels, "Siamese BiLSTM with Attention")
     except Exception as e:
-        print(f"Error loading or evaluating Attention model: {e}")
+        print(f"⚠ Error evaluating Attention model: {e}")
         metrics_attention = {"accuracy": 0, "f1": 0, "roc_auc": 0}
-        
-    print("\n--- Performance Comparison ---")
-    print(f"| Metric   | BiLSTM   | BiLSTM w/ Attention |")
-    print(f"|----------|----------|---------------------|")
-    print(f"| Accuracy | {metrics_bilstm['accuracy']:.4f}   | {metrics_attention['accuracy']:.4f}            |")
-    print(f"| F1-Score | {metrics_bilstm['f1']:.4f}   | {metrics_attention['f1']:.4f}            |")
-    print(f"| ROC-AUC  | {metrics_bilstm['roc_auc']:.4f}   | {metrics_attention['roc_auc']:.4f}            |")
     
-    # --- Step 6: Plotting ---
-    # --- MODIFICATION: Check if history objects exist ---
-    # Only plot if we just trained (history object exists)
-    if history_bilstm:
-        plot_history(history_bilstm, "Siamese_BiLSTM")
+    # Step 6: Comparison
+    print("\n" + "="*60)
+    print("PERFORMANCE COMPARISON")
+    print("="*60)
+    print(f"{'Metric':<15} {'BiLSTM':<12} {'BiLSTM + Attention':<20}")
+    print("-" * 60)
+    print(f"{'Accuracy':<15} {metrics_bilstm['accuracy']:<12.4f} {metrics_attention['accuracy']:<20.4f}")
+    print(f"{'F1-Score':<15} {metrics_bilstm['f1']:<12.4f} {metrics_attention['f1']:<20.4f}")
+    print(f"{'ROC-AUC':<15} {metrics_bilstm['roc_auc']:<12.4f} {metrics_attention['roc_auc']:<20.4f}")
+    print("="*60)
+    
+    # Determine winner
+    if metrics_attention['f1'] > metrics_bilstm['f1']:
+        print(f"\n🏆 Winner: BiLSTM with Attention (F1: {metrics_attention['f1']:.4f})")
+    elif metrics_bilstm['f1'] > metrics_attention['f1']:
+        print(f"\n🏆 Winner: BiLSTM (F1: {metrics_bilstm['f1']:.4f})")
     else:
-        print(f"Skipping plot for BiLSTM (no training history). Graph file '{'Siamese_BiLSTM'}_training_graphs.png' may be from a previous run.")
-        
-    if history_attention:
-        plot_history(history_attention, "Siamese_Attention_BiLSTM")
-    else:
-        print(f"Skipping plot for Attention (no training history). Graph file '{'Siamese_Attention_BiLSTM'}_training_graphs.png' may be from a previous run.")
-
+        print(f"\n🤝 Tie (F1: {metrics_bilstm['f1']:.4f})")
     
-    # --- Step 7: Qualitative Analysis ---
-    # --- MODIFICATION: Check if model objects exist ---
-    try:
-        if best_model_bilstm:
-            show_qualitative_results(best_model_bilstm, val_data, "Siamese BiLSTM")
-        else:
-            raise ValueError("Model object 'best_model_bilstm' is None (loading failed).")
-    except Exception as e:
-        print(f"Error during qualitative analysis for BiLSTM: {e}")
-        
-    try:
-        if best_model_attention:
-            show_qualitative_results(best_model_attention, val_data, "Siamese BiLSTM with Attention")
-        else:
-            raise ValueError("Model object 'best_model_attention' is None (loading failed).")
-    except Exception as e:
-        print(f"Error during qualitative analysis for Attention model: {e}")
-    
-    print("\n--- SCRIPT COMPLETE ---")
+    print("\n" + "="*60)
+    print("✓ SCRIPT COMPLETE")
+    print("="*60 + "\n")
 
 if __name__ == "__main__":
     main()
